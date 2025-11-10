@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+import sys, os, threading, time, cv2, json, numpy as np
+from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import Qt
+import Jetson.GPIO as GPIO
+from ultralytics import YOLO
+
+# ===== SETTINGS =====
+MODEL_PATH = "/home/root1/yolov8l.engine"
+ALARM_PIN, BUZZER_PIN = 12, 16
+CAM_INDEX, CAM_WIDTH, CAM_HEIGHT = 0, 1280, 720
+MAX_POINTS = 20
+FENCE_FILE = "/home/root1/fence_points.json"
+CLOSE_THRESHOLD = 15  # pixels to close loop manually
+# ====================
+
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup(ALARM_PIN, GPIO.OUT, initial=GPIO.HIGH)
+GPIO.setup(BUZZER_PIN, GPIO.OUT, initial=GPIO.LOW)
+
+def alarm_on():  GPIO.output(ALARM_PIN, GPIO.HIGH)
+def alarm_off(): GPIO.output(ALARM_PIN, GPIO.LOW)
+def buzzer_pulse():
+    GPIO.output(BUZZER_PIN, GPIO.HIGH)
+    time.sleep(0.15)
+    GPIO.output(BUZZER_PIN, GPIO.LOW)
+
+def line_intersect(p1, p2, p3, p4):
+    """Check if two line segments intersect"""
+    def ccw(a,b,c): return (c[1]-a[1])*(b[0]-a[0]) > (b[1]-a[1])*(c[0]-a[0])
+    return ccw(p1,p3,p4) != ccw(p2,p3,p4) and ccw(p1,p2,p3) != ccw(p1,p2,p4)
+
+def load_fence():
+    if os.path.exists(FENCE_FILE):
+        try:
+            with open(FENCE_FILE, "r") as f:
+                pts = json.load(f)
+            if isinstance(pts, list) and all(isinstance(p, list) and len(p)==2 for p in pts):
+                print(f"✅ Loaded saved fence with {len(pts)} points")
+                return [(int(x), int(y)) for x,y in pts]
+        except Exception as e:
+            print("⚠️ Error loading fence:", e)
+    return []
+
+def save_fence(pts):
+    try:
+        with open(FENCE_FILE, "w") as f:
+            json.dump(pts, f)
+        print(f"💾 Fence saved ({len(pts)} points)")
+    except Exception as e:
+        print("⚠️ Error saving fence:", e)
+
+class DetectorThread(threading.Thread):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+        self.running = True
+        self.model = YOLO(MODEL_PATH)
+        self.cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+        self.fence_pts = load_fence()
+        self.last_alert = False
+
+    def run(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret: continue
+
+            results = self.model.predict(frame, classes=[0], device=0, verbose=False)
+            boxes = []
+            if len(results) and results[0].boxes is not None:
+                for box in results[0].boxes.xyxy.cpu().numpy():
+                    boxes.append(tuple(map(int, box)))
+
+            alert = False
+            if len(self.fence_pts) >= 2:
+                fence_edges = [(self.fence_pts[i], self.fence_pts[i+1]) for i in range(len(self.fence_pts)-1)]
+                for (a,b,c,d) in boxes:
+                    edges = [((a,b),(c,b)), ((c,b),(c,d)), ((c,d),(a,d)), ((a,d),(a,b))]
+                    for e1 in edges:
+                        for e2 in fence_edges:
+                            if line_intersect(e1[0], e1[1], e2[0], e2[1]):
+                                alert = True
+                                break
+                        if alert: break
+                    if alert: break
+
+            if alert:
+                alarm_off()
+                if not self.last_alert:
+                    threading.Thread(target=buzzer_pulse, daemon=True).start()
+            else:
+                alarm_on()
+            self.last_alert = alert
+
+            for (a,b,c,d) in boxes:
+                cv2.rectangle(frame, (a,b), (c,d), (0,255,0), 2)
+            if len(self.fence_pts) > 1:
+                cv2.polylines(frame, [np.array(self.fence_pts, np.int32)], False, (238,130,238), 3)
+                for pt in self.fence_pts:
+                    cv2.circle(frame, pt, 5, (255,255,255), -1)
+
+            self.callback(frame, len(boxes), alert)
+
+        self.cap.release()
+        alarm_on()
+        GPIO.cleanup()
+
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("AI Security System - Manual Fence Draw")
+        self.setGeometry(100, 100, 1400, 800)
+
+        layout = QHBoxLayout(self)
+        left = QVBoxLayout()
+        self.status = QLabel("Status: ✅ CLEAR")
+        self.status.setStyleSheet("font-size:20px;color:green;font-weight:bold;")
+        self.count = QLabel("People: 0")
+        self.fence_status = QLabel("")
+        self.geo_btn = QPushButton("Clear Fence")
+        self.geo_btn.clicked.connect(self.clear_fence)
+        for w in [self.status, self.count, self.fence_status, self.geo_btn]:
+            left.addWidget(w)
+        left.addStretch()
+        lw = QWidget(); lw.setLayout(left); lw.setFixedWidth(280)
+        layout.addWidget(lw)
+
+        self.video_label = QLabel()
+        self.video_label.setStyleSheet("background:black;")
+        layout.addWidget(self.video_label)
+
+        self.thread = DetectorThread(self.update_frame)
+        self.thread.start()
+        self.video_label.mousePressEvent = self.add_point
+        self.update_fence_status()
+
+    def update_fence_status(self):
+        pts = load_fence()
+        if len(pts) >= 2:
+            self.fence_status.setText(f"🟣 Fence Loaded ({len(pts)} points)")
+            self.fence_status.setStyleSheet("font-size:16px;color:violet;font-weight:bold;")
+        else:
+            self.fence_status.setText("⚪ No Fence Set")
+            self.fence_status.setStyleSheet("font-size:16px;color:gray;font-weight:bold;")
+
+    def update_frame(self, frame, count, alert):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h,w,ch = rgb.shape
+        img = QImage(rgb.data, w, h, ch*w, QImage.Format_RGB888)
+        self.video_label.setPixmap(QPixmap.fromImage(img))
+        self.count.setText(f"People: {count}")
+        if alert:
+            self.status.setText("🚨 FENCE BREACH DETECTED")
+            self.status.setStyleSheet("font-size:20px;color:red;font-weight:bold;")
+        else:
+            self.status.setText("Status: ✅ CLEAR")
+            self.status.setStyleSheet("font-size:20px;color:green;font-weight:bold;")
+
+    def add_point(self, e):
+        x, y = e.x(), e.y()
+        pts = self.thread.fence_pts
+        if len(pts) > 0:
+            dist = np.hypot(x - pts[0][0], y - pts[0][1])
+            # Close loop manually by clicking near the first point
+            if dist < CLOSE_THRESHOLD:
+                pts.append(pts[0])
+                self.status.setText("Fence loop closed manually.")
+                save_fence(pts)
+                self.update_fence_status()
+                return
+        if len(pts) < MAX_POINTS:
+            pts.append((x, y))
+            save_fence(pts)
+            self.status.setText(f"Added point {len(pts)}")
+            self.update_fence_status()
+        else:
+            self.status.setText("Max 20 points reached!")
+
+    def clear_fence(self):
+        self.thread.fence_pts.clear()
+        save_fence([])
+        self.status.setText("Fence cleared. Draw new fence.")
+        self.update_fence_status()
+
+    def closeEvent(self, e):
+        self.thread.running = False
+        alarm_on()
+        GPIO.cleanup()
+        e.accept()
+
+if __name__ == "__main__":
+    os.environ.setdefault("DISPLAY", ":0")
+    os.environ.setdefault("XAUTHORITY", "/home/root1/.Xauthority")
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
