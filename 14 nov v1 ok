@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+"""
+Full human detection + manual geofence GUI for Jetson/Rtime board.
+
+Features:
+- Uses /dev/video1 (CAM_INDEX=1) via V4L2
+- Ultralytics YOLO model for person detection (class 0)
+- Manual fence draw (Edit Fence toggle) + Clear Fence button
+- Fence is saved to FENCE_FILE and loaded on startup
+- Geofence detection: point-in-polygon (box center) OR bounding-box edge intersection
+- GPIO control via libgpiod: picks first available candidate line
+  - LED wiring: +3.3V -> LED (+) -> resistor -> LED (-) -> GPIO pin (GPIO sinks to GND to light LED)
+- Displays FPS, CPU, GPU load and GPIO state on GUI
+- Clean shutdown
+"""
+
+import sys, os, time, threading, json, math
+import cv2
+import numpy as np
+from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout
+from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtCore import Qt, QTimer
+# Optional libs
+try:
+    import GPUtil
+except Exception:
+    GPUtil = None
+import psutil
+
+# Use libgpiod for GPIO control (works on Rtime / non-devkit boards)
+try:
+    import gpiod
+except Exception:
+    gpiod = None
+
+# Ultralytics YOLO
+try:
+    from ultralytics import YOLO
+except Exception as e:
+    print("ERROR: ultralytics not available:", e)
+    YOLO = None
+
+# ===== USER CONFIG =====
+MODEL_PATH = "/home/root1/yolov8l.engine"   # change if needed
+CAM_INDEX = 1       # /dev/video1
+CAM_WIDTH = 1280
+CAM_HEIGHT = 720
+FENCE_FILE = "/home/root1/fence_points.json"
+MAX_POINTS = 20
+CLOSE_THRESHOLD = 20   # pixels from first point to close loop
+DELAY_BEFORE_CAMERA = 3.0  # seconds
+YOLO_DEVICE = 0  # GPU device 0 (Orin), use 'cpu' or -1 to force CPU
+# Candidate gpio lines to try (chip_name, line_number)
+GPIO_CANDIDATES = [
+    ("gpiochip0", 2),    # PA.02
+    ("gpiochip0", 38),   # PG.03
+    ("gpiochip0", 46),   # PH.03
+    ("gpiochip0", 80),   # PM.04
+    ("gpiochip0", 101),  # PQ.01
+    ("gpiochip0", 122),  # PY.00
+    ("gpiochip1", 2),    # PAA.02
+    ("gpiochip1", 3),    # PAA.03
+]
+# =======================
+
+# ---- GPIO helpers using libgpiod ----
+class GPIODController:
+    def __init__(self, candidates):
+        self.candidates = candidates
+        self.chip = None
+        self.line = None
+        self.chip_name = None
+        self.line_num = None
+        self.available = False
+        if gpiod is None:
+            print("⚠️ libgpiod not installed; GPIO disabled.")
+            return
+        self._auto_select()
+
+    def _auto_select(self):
+        for chipname, ln in self.candidates:
+            try:
+                chip = gpiod.Chip(chipname)
+            except Exception:
+                continue
+            try:
+                line = chip.get_line(ln)
+                # try to request as output and release immediately to test availability
+                try:
+                    line.request(consumer="human_detect_probe", type=gpiod.LINE_REQ_DIR_OUT)
+                    line.set_value(1)  # set safe (HIGH)
+                    line.set_value(0)
+                    line.release()
+                    # good — keep this one
+                    self.chip = chip
+                    self.line = chip.get_line(ln)
+                    self.chip_name = chipname
+                    self.line_num = ln
+                    self.available = True
+                    print(f"✅ Selected GPIO {chipname} line {ln} for alarm output.")
+                    return
+                except Exception as e:
+                    # cannot acquire this line
+                    # print("probe fail", chipname, ln, e)
+                    continue
+            except Exception:
+                continue
+        print("⚠️ No usable GPIO candidate found. GPIO disabled.")
+
+    def request(self, consumer="human_detect"):
+        if not self.available:
+            return False
+        try:
+            self.line.request(consumer=consumer, type=gpiod.LINE_REQ_DIR_OUT)
+            # start safe = HIGH (3.3V). We assume active-high when released; wiring is +3.3V -> LED -> GPIO
+            try:
+                self.line.set_value(1)
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            print("⚠️ Failed request GPIO line:", e)
+            return False
+
+    def release(self):
+        if not self.available or self.line is None:
+            return
+        try:
+            self.line.set_value(1)  # safe
+        except Exception:
+            pass
+        try:
+            self.line.release()
+        except Exception:
+            pass
+
+    def set_high(self):
+        if not self.available or self.line is None:
+            return
+        try:
+            self.line.set_value(1)
+        except Exception:
+            pass
+
+    def set_low(self):
+        if not self.available or self.line is None:
+            return
+        try:
+            self.line.set_value(0)
+        except Exception:
+            pass
+
+# ---- Geometry helpers ----
+def line_intersect(p1, p2, p3, p4):
+    def ccw(a,b,c): return (c[1]-a[1])*(b[0]-a[0]) > (b[1]-a[1])*(c[0]-a[0])
+    return ccw(p1,p3,p4) != ccw(p2,p3,p4) and ccw(p1,p2,p3) != ccw(p1,p2,p4)
+
+def load_fence():
+    try:
+        if os.path.exists(FENCE_FILE):
+            with open(FENCE_FILE, "r") as f:
+                pts = json.load(f)
+            if isinstance(pts, list):
+                return [(int(x), int(y)) for x,y in pts]
+    except Exception as e:
+        print("⚠️ load_fence error:", e)
+    return []
+
+def save_fence(pts):
+    try:
+        with open(FENCE_FILE, "w") as f:
+            json.dump(pts, f)
+        # print(f"Saved fence ({len(pts)} points)")
+    except Exception as e:
+        print("⚠️ save_fence error:", e)
+
+# ---- Detector Thread ----
+class DetectorThread(threading.Thread):
+    def __init__(self, callback, gpio_ctrl: GPIODController):
+        super().__init__(daemon=True)
+        self.callback = callback
+        self.running = True
+        self.gpio = gpio_ctrl
+        # load model
+        self.model = None
+        if YOLO is not None:
+            try:
+                # load engine or model
+                self.model = YOLO(MODEL_PATH)
+            except Exception as e:
+                print("⚠️ Failed to load YOLO model:", e)
+                self.model = None
+        else:
+            print("⚠️ YOLO (ultralytics) not available.")
+        # Camera init with delay
+        time.sleep(DELAY_BEFORE_CAMERA)
+        self.cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+        if not self.cap.isOpened():
+            print("❌ Camera failed to open on index", CAM_INDEX)
+        else:
+            print("✅ Camera opened on index", CAM_INDEX)
+        self.fence_pts = load_fence()
+        self.last_alert = False
+        self.fps = 0.0
+
+        # request gpio line if available
+        if self.gpio and self.gpio.available:
+            ok = self.gpio.request()
+            if not ok:
+                print("⚠️ Could not request GPIO line; GPIO disabled.")
+                self.gpio.available = False
+
+    def run(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                # don't spam; notify and continue
+                # print("⚠️ No frame from camera yet.")
+                time.sleep(0.05)
+                continue
+
+            t0 = time.time()
+            boxes = []
+            # run detection if model loaded
+            if self.model is not None:
+                try:
+                    results = self.model.predict(frame, classes=[0], device=YOLO_DEVICE, verbose=False)
+                    if len(results) and results[0].boxes is not None:
+                        for box in results[0].boxes.xyxy.cpu().numpy():
+                            boxes.append(tuple(map(int, box)))
+                except Exception as e:
+                    # fallback: no detections
+                    # print("⚠️ Detection error:", e)
+                    boxes = []
+            # geofence check: center-in-polygon OR intersection
+            alert = False
+            if len(self.fence_pts) >= 3:
+                poly = np.array(self.fence_pts, np.int32)
+                for (a,b,c,d) in boxes:
+                    cx, cy = (a+c)//2, (b+d)//2
+                    # pointPolygonTest: +1 inside, 0 on edge, -1 outside
+                    inside = False
+                    try:
+                        inside = cv2.pointPolygonTest(poly, (cx, cy), False) >= 0
+                    except Exception:
+                        inside = False
+                    intersects = False
+                    # check box edges intersect polygon edges
+                    fence_edges = [(tuple(poly[i]), tuple(poly[i+1])) for i in range(len(poly)-1)]
+                    b_edges = [((a,b),(c,b)), ((c,b),(c,d)), ((c,d),(a,d)), ((a,d),(a,b))]
+                    for e1 in b_edges:
+                        for e2 in fence_edges:
+                            if line_intersect(e1[0], e1[1], e2[0], e2[1]):
+                                intersects = True
+                                break
+                        if intersects:
+                            break
+                    if inside or intersects:
+                        alert = True
+                        break
+
+            # set gpio according to alert (active-low LED: we set pin LOW to sink to GND so LED lights)
+            if self.gpio and self.gpio.available:
+                if alert:
+                    # sink to ground -> LED glows (since LED + is at 3.3V)
+                    self.gpio.set_low()
+                else:
+                    # safe -> set HIGH (3.3V) -> LED off
+                    self.gpio.set_high()
+
+            # prepare frame drawing
+            for (a,b,c,d) in boxes:
+                cx, cy = (a+c)//2, (b+d)//2
+                cv2.rectangle(frame, (a,b), (c,d), (0,255,0), 2)
+                cv2.circle(frame, (cx, cy), 4, (0,0,255), -1)
+
+            if len(self.fence_pts) > 1:
+                # closed loop: if last point equals first, we draw closed polygon
+                pts_np = np.array(self.fence_pts, np.int32)
+                is_closed = (len(self.fence_pts) > 2 and self.fence_pts[0] == self.fence_pts[-1])
+                cv2.polylines(frame, [pts_np], isClosed=is_closed, color=(238,130,238), thickness=3)
+                for pt in self.fence_pts:
+                    cv2.circle(frame, pt, 5, (255,255,255), -1)
+
+            t1 = time.time()
+            self.fps = round(1.0 / (t1 - t0 + 1e-6), 1)
+            # callback to GUI
+            try:
+                self.callback(frame, len(boxes), alert, self.fps)
+            except Exception:
+                pass
+
+        # cleanup
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+        if self.gpio:
+            self.gpio.set_high()
+            self.gpio.release()
+
+# ---- GUI ----
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("AI Security System — Geofence")
+        self.setGeometry(80, 60, 1500, 900)
+
+        # left panel
+        layout = QHBoxLayout(self)
+        left = QVBoxLayout()
+        self.status = QLabel("Status: ✅ CLEAR")
+        self.status.setStyleSheet("font-size:20px;color:green;font-weight:bold;")
+        self.count = QLabel("People: 0")
+        self.fps_label = QLabel("FPS: 0")
+        self.cpu_label = QLabel("CPU: 0%")
+        self.gpu_label = QLabel("GPU: N/A")
+        self.gpio_label = QLabel("GPIO: None")
+        self.fence_info = QLabel("Fence: not set")
+        self.edit_btn = QPushButton("🟣 Edit Fence")
+        self.edit_btn.setCheckable(True)
+        self.clear_btn = QPushButton("🧹 Clear Fence")
+        self.clear_btn.clicked.connect(self.clear_fence)
+        self.edit_btn.clicked.connect(self.toggle_edit)
+
+        for w in [self.status, self.count, self.fps_label, self.cpu_label, self.gpu_label, self.gpio_label, self.fence_info, self.edit_btn, self.clear_btn]:
+            left.addWidget(w)
+        left.addStretch()
+        left_widget = QWidget(); left_widget.setLayout(left); left_widget.setFixedWidth(320)
+        layout.addWidget(left_widget)
+
+        # video display
+        self.video_label = QLabel()
+        self.video_label.setStyleSheet("background:black;")
+        layout.addWidget(self.video_label)
+
+        # state
+        self.frame = None
+        self.latest_count = 0
+        self.latest_alert = False
+        self.latest_fps = 0.0
+        self.edit_mode = False
+        self.lock = threading.Lock()
+
+        # initialize gpio controller
+        self.gpio = GPIODController(GPIO_CANDIDATES)
+        if self.gpio.available:
+            self.gpio_label.setText(f"GPIO: {self.gpio.chip_name} line {self.gpio.line_num} (HIGH=Safe)")
+        else:
+            self.gpio_label.setText("GPIO: None (disabled)")
+
+        # detector thread
+        self.detector = DetectorThread(self.on_frame, gpio_ctrl=self.gpio)
+        self.detector.start()
+
+        # mouse event
+        self.video_label.mousePressEvent = self.on_mouse_click
+
+        # timer for GUI updates & stats
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.gui_update)
+        self.timer.start(100)  # 10 fps UI update for smoothness
+
+        # stats timer (1s)
+        self.stats_timer = QTimer(self)
+        self.stats_timer.timeout.connect(self.update_stats)
+        self.stats_timer.start(1000)
+
+        self.update_fence_status()
+
+    def toggle_edit(self):
+        self.edit_mode = self.edit_btn.isChecked()
+        if self.edit_mode:
+            self.status.setText("🟣 Edit Fence Mode — Click to add points (click near first to close)")
+            self.status.setStyleSheet("font-size:18px;color:violet;font-weight:bold;")
+        else:
+            self.status.setText("Status: ✅ CLEAR")
+            self.status.setStyleSheet("font-size:18px;color:green;font-weight:bold;")
+        self.update_fence_status()
+
+    def clear_fence(self):
+        with self.lock:
+            self.detector.fence_pts = []
+            save_fence([])
+        self.update_fence_status()
+        self.status.setText("🧹 Fence cleared")
+        self.status.setStyleSheet("font-size:16px;color:orange;font-weight:bold;")
+
+    def update_fence_status(self):
+        pts = load_fence()
+        if len(pts) >= 2:
+            self.fence_info.setText(f"Fence points: {len(pts)} (saved)")
+            self.fence_info.setStyleSheet("color:violet;")
+        else:
+            self.fence_info.setText("Fence: not set")
+            self.fence_info.setStyleSheet("color:gray;")
+
+    def on_frame(self, frame, count, alert, fps):
+        # called from detector thread
+        with self.lock:
+            self.frame = frame.copy()
+            self.latest_count = count
+            self.latest_alert = alert
+            self.latest_fps = fps
+
+    def gui_update(self):
+        with self.lock:
+            if self.frame is None:
+                return
+            frame = self.frame.copy()
+            count = self.latest_count
+            alert = self.latest_alert
+            fps = self.latest_fps
+
+        # convert and show
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h,w,ch = rgb.shape
+            img = QImage(rgb.data, w, h, ch*w, QImage.Format_RGB888)
+            self.video_label.setPixmap(QPixmap.fromImage(img).scaled(self.video_label.width(), self.video_label.height(), Qt.KeepAspectRatio))
+        except Exception:
+            pass
+
+        self.count.setText(f"People: {count}")
+        self.fps_label.setText(f"FPS: {fps}")
+        if alert:
+            self.status.setText("🚨 HUMAN INSIDE FENCE")
+            self.status.setStyleSheet("font-size:20px;color:red;font-weight:bold;")
+            self.gpio_label.setText(f"GPIO: {'LOW (alert)' if self.gpio.available and self.gpio.line_num is not None else 'LOW (no-gpio)'}")
+        else:
+            if not self.edit_mode:
+                self.status.setText("Status: ✅ CLEAR")
+                self.status.setStyleSheet("font-size:18px;color:green;font-weight:bold;")
+            self.gpio_label.setText(f"GPIO: {'HIGH (safe)' if self.gpio.available and self.gpio.line_num is not None else 'HIGH (no-gpio)'}")
+
+    def update_stats(self):
+        # CPU
+        self.cpu_label.setText(f"CPU: {psutil.cpu_percent()}%")
+        # GPU via GPUtil if available
+        if GPUtil is not None:
+            gpus = GPUtil.getGPUs()
+            if len(gpus) > 0:
+                self.gpu_label.setText(f"GPU: {int(gpus[0].load*100)}%")
+            else:
+                self.gpu_label.setText("GPU: Jetson (not detected by GPUtil)")
+        else:
+            self.gpu_label.setText("GPU: Jetson")
+
+    def on_mouse_click(self, event):
+        if not self.edit_mode:
+            return
+        x = event.x()
+        y = event.y()
+        # need to transform click coords (label scaled) -> frame coords
+        with self.lock:
+            if self.frame is None:
+                return
+            h_label = self.video_label.height()
+            w_label = self.video_label.width()
+            h_frame, w_frame, _ = self.frame.shape
+
+        # compute scale and offsets used by KeepAspectRatio scaling
+        scale = min(w_label / w_frame, h_label / h_frame)
+        new_w = int(w_frame * scale)
+        new_h = int(h_frame * scale)
+        x_off = (w_label - new_w) // 2
+        y_off = (h_label - new_h) // 2
+
+        # map mouse to frame coordinates
+        fx = int((x - x_off) / scale)
+        fy = int((y - y_off) / scale)
+        if fx < 0 or fy < 0 or fx >= w_frame or fy >= h_frame:
+            return
+
+        with self.lock:
+            pts = self.detector.fence_pts
+            if pts and len(pts) > 0:
+                dx = fx - pts[0][0]
+                dy = fy - pts[0][1]
+                dist = math.hypot(dx, dy)
+                if dist <= CLOSE_THRESHOLD and len(pts) >= 3:
+                    # close loop
+                    pts.append(pts[0])
+                    save_fence(pts)
+                    self.edit_btn.setChecked(False)
+                    self.edit_mode = False
+                    self.update_fence_status()
+                    self.status.setText("Fence loop closed ✅")
+                    return
+            if len(pts) < MAX_POINTS:
+                pts.append((fx, fy))
+                save_fence(pts)
+                self.update_fence_status()
+                self.status.setText(f"Added point {len(pts)}")
+            else:
+                self.status.setText("Max points reached")
+
+    def closeEvent(self, e):
+        # stop detector
+        try:
+            self.detector.running = False
+        except Exception:
+            pass
+        # ensure gpio safe
+        if self.gpio:
+            self.gpio.set_high()
+            self.gpio.release()
+        e.accept()
+
+# ---- MAIN ----
+def main():
+    os.environ.setdefault("DISPLAY", ":0")
+    os.environ.setdefault("XAUTHORITY", "/home/root1/.Xauthority")
+
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
